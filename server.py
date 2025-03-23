@@ -1,118 +1,195 @@
 import socket
-import threading
-import os
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding, hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
-from cryptography.hazmat.backends import default_backend
-import pickle
+import json
+import random
 import base64
+import time
+import secrets
+import os
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Симметричные ключи (предполагается, что сервер знает их заранее)
-key_AS = os.urandom(32)  # ключ для общения с Алисой
-key_BS = os.urandom(32)  # ключ для общения с Бобом
+def generate_key(password, salt):
+    """Генерирует ключ на основе пароля"""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+    )
+    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    return key
 
-# Асимметричные ключи
-private_key_server = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048,
-    backend=default_backend()
-)
-public_key_server = private_key_server.public_key()
+def encrypt(message, key):
+    """Шифрует сообщение с помощью ключа"""
+    f = Fernet(key)
+    return f.encrypt(json.dumps(message).encode())
 
-# Словарь для хранения ключей клиентов
-client_keys = {
-    'Alice': {'symmetric': key_AS, 'public_key': None},
-    'Bob': {'symmetric': key_BS, 'public_key': None}
-}
+def decrypt(encrypted_message, key):
+    """Расшифровывает сообщение с помощью ключа"""
+    f = Fernet(key)
+    return json.loads(f.decrypt(encrypted_message).decode())
 
-def encrypt_symmetric(key, message):
-    iv = os.urandom(16)
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(message) + padder.finalize()
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-    return iv + encrypted_data
+def handle_kerberos_request(conn, data):
+    """Обработка запроса по протоколу Kerberos"""
+    try:
+        # Получаем идентификаторы Алисы и Боба
+        alice_id, bob_id = data.decode().split(',')
+        
+        # Генерируем метку времени
+        timestamp = str(int(time.time()))
+        lifetime = "3600"  # Время жизни билета в секундах (1 час)
+        
+        # Генерируем сеансовый ключ
+        session_key = secrets.token_hex(16)
+        
+        # Получаем ключи для Алисы и Боба
+        alice_key = generate_key("alice_password", b"alice_salt")
+        bob_key = generate_key("bob_password", b"bob_salt")
+        
+        # Формируем билет для Боба
+        ticket_for_bob = json.dumps({
+            "timestamp": timestamp,
+            "lifetime": lifetime,
+            "alice_id": alice_id,
+            "session_key": session_key
+        })
+        encrypted_ticket_for_bob = encrypt(ticket_for_bob, bob_key)
+        
+        # Формируем ответ для Алисы
+        response_for_alice = json.dumps({
+            "timestamp": timestamp,
+            "lifetime": lifetime,
+            "bob_id": bob_id,
+            "session_key": session_key,
+            "ticket_for_bob": encrypted_ticket_for_bob
+        })
+        encrypted_response_for_alice = encrypt(response_for_alice, alice_key)
+        
+        # Отправляем ответ Алисе
+        conn.sendall(encrypted_response_for_alice.encode())
+        print(f"[SERVER] Отправлен Kerberos-ответ для Алисы")
+        return True
+    except Exception as e:
+        print(f"[SERVER] Ошибка при обработке Kerberos-запроса: {e}")
+        conn.sendall(b"ERROR: " + str(e).encode())
+        return False
 
-def decrypt_symmetric(key, ciphertext):
-    iv = ciphertext[:16]
-    encrypted_data = ciphertext[16:]
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded_data = decryptor.update(encrypted_data) + decryptor.finalize()
-    unpadder = padding.PKCS7(128).unpadder()
-    return unpadder.update(padded_data) + unpadder.finalize()
+def handle_symmetric_request(conn, data):
+    """Обработка запроса по симметричному протоколу Нидхема-Шрёдера"""
+    try:
+        message = json.loads(data.decode())
+        
+        if message.get("type") == "M0":
+            sender = message.get("sender")
+            recipient = message.get("recipient")
+            nonce = message.get("nonce")
+            
+            print(f"[SERVER] Получен запрос M0 от {sender} для {recipient} с nonce={nonce}")
+            
+            # Проверяем, есть ли у нас ключи для отправителя и получателя
+            if sender not in keys or recipient not in keys:
+                print(f"[SERVER] Ошибка: ключи для {sender} или {recipient} не найдены")
+                conn.sendall(json.dumps({"error": "Неизвестный отправитель или получатель"}).encode())
+                return False
+            
+            # Получаем ключи для отправителя и получателя
+            sender_key = keys[sender]
+            recipient_key = keys[recipient]
+            
+            # Генерируем сеансовый ключ
+            session_key = Fernet.generate_key().decode()
+            
+            # Формируем сообщение для получателя (K, A)
+            message_for_recipient = {
+                "key": session_key,
+                "sender": sender
+            }
+            encrypted_for_recipient = encrypt(message_for_recipient, recipient_key)
+            
+            # Формируем сообщение M1 для отправителя (N_A, B, K, E_B(K, A))
+            message_for_sender = {
+                "nonce": nonce,
+                "recipient": recipient,
+                "key": session_key,
+                "encrypted_for_recipient": encrypted_for_recipient
+            }
+            encrypted_for_sender = encrypt(message_for_sender, sender_key)
+            
+            # Отправляем ответ
+            response = {
+                "type": "M1",
+                "data": base64.b64encode(encrypted_for_sender).decode()
+            }
+            
+            print(f"[SERVER] Отправлен ответ M1 для {sender}")
+            conn.sendall(json.dumps(response).encode())
+            return True
+        else:
+            print(f"[SERVER] Ошибка: неизвестный тип сообщения {message.get('type')}")
+            conn.sendall(json.dumps({"error": "Неизвестный тип сообщения"}).encode())
+            return False
+    except Exception as e:
+        print(f"[SERVER] Ошибка при обработке симметричного запроса: {e}")
+        conn.sendall(json.dumps({"error": str(e)}).encode())
+        return False
 
-def handle_symmetric_request(data, client_address):
-    sender, recipient, nonce = pickle.loads(data)
-    print(f"Получен запрос от {sender} для установки соединения с {recipient}")
+def handle_client(conn, addr):
+    """Обработка соединения с клиентом"""
+    print(f"[SERVER] Новое соединение: {addr}")
     
-    # Генерация сессионного ключа
-    session_key = os.urandom(32)
-    
-    # Подготовка сообщения для получателя
-    recipient_msg = pickle.dumps((session_key, sender))
-    encrypted_recipient_msg = encrypt_symmetric(client_keys[recipient]['symmetric'], recipient_msg)
-    
-    # Подготовка сообщения для отправителя
-    sender_msg = pickle.dumps((nonce, recipient, session_key, encrypted_recipient_msg))
-    encrypted_sender_msg = encrypt_symmetric(client_keys[sender]['symmetric'], sender_msg)
-    
-    return encrypted_sender_msg
-
-def handle_asymmetric_registration(data):
-    client_name, public_key_bytes = pickle.loads(data)
-    client_keys[client_name]['public_key'] = pickle.loads(public_key_bytes)
-    print(f"Зарегистрирован открытый ключ для {client_name}")
-    return pickle.dumps(public_key_server)
-
-def handle_client(client_socket, client_address):
     try:
         while True:
-            data = client_socket.recv(4096)
+            data = conn.recv(4096)
             if not data:
                 break
-
-            protocol_type = data[:1]
-            message_data = data[1:]
+                
+            command = data[:10].decode().strip()
             
-            if protocol_type == b"S":  # Симметричный протокол
-                response = handle_symmetric_request(message_data, client_address)
-                client_socket.send(b"S" + response)
-            elif protocol_type == b"A":  # Асимметричная регистрация ключей
-                response = handle_asymmetric_registration(message_data)
-                client_socket.send(b"A" + response)
-            elif protocol_type == b"K":  # Запрос публичного ключа
-                client_name = message_data.decode()
-                if client_name in client_keys and client_keys[client_name]['public_key']:
-                    public_key_bytes = pickle.dumps(client_keys[client_name]['public_key'])
-                    client_socket.send(b"K" + public_key_bytes)
-                else:
-                    client_socket.send(b"E" + b"Public key not found")
+            if command == "SYMMETRIC":
+                handle_symmetric_request(conn, data[10:])
+            elif command == "KERBEROSal":
+                handle_kerberos_request(conn, data[10:])
+            else:
+                print(f"[SERVER] Неизвестная команда: {command}")
+                conn.sendall(b"ERROR: Unknown command")
+    except Exception as e:
+        print(f"[SERVER] Ошибка при обработке клиента: {e}")
     finally:
-        client_socket.close()
+        conn.close()
+        print(f"[SERVER] Соединение закрыто: {addr}")
 
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('localhost', 5000))
-    server.listen(5)
-    
-    print("Доверенный центр запущен и ожидает подключений...")
-    print(f"Ключ Алисы: {base64.b64encode(key_AS).decode()}")
-    print(f"Ключ Боба: {base64.b64encode(key_BS).decode()}")
-    
-    try:
-        while True:
-            client_socket, client_address = server.accept()
-            print(f"Подключение от {client_address}")
-            client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-            client_thread.daemon = True
-            client_thread.start()
-    except KeyboardInterrupt:
-        print("Сервер остановлен")
-    finally:
-        server.close()
+# Параметры сервера
+HOST = '127.0.0.1'
+PORT = 5000
 
-if __name__ == "__main__":
-    start_server()
+# Предварительно установленные секретные ключи для Алисы и Боба
+# В реальной системе эти ключи должны быть защищены
+SALT = b'salt_for_key_derivation'
+ALICE_PASSWORD = "alice_secret_password"
+BOB_PASSWORD = "bob_secret_password"
+
+# Генерируем ключи для Алисы и Боба
+E_A = generate_key(ALICE_PASSWORD, SALT)
+E_B = generate_key(BOB_PASSWORD, SALT)
+
+print(f"Ключ Алисы: {E_A}")
+print(f"Ключ Боба: {E_B}")
+
+# Словарь для хранения ключей участников
+keys = {
+    "Alice": E_A,
+    "Bob": E_B
+}
+
+# Запускаем сервер
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+    server_socket.bind((HOST, PORT))
+    server_socket.listen()
+    print(f"Сервер запущен на {HOST}:{PORT}")
+    
+    while True:
+        conn, addr = server_socket.accept()
+        with conn:
+            print(f"Подключение с {addr}")
+            handle_client(conn, addr)
